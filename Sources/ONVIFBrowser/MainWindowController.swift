@@ -13,6 +13,12 @@ final class DeviceEntry {
     var status: String = ""
     var statusIsError = false
     var isLoading = false
+    var isManual = false
+
+    /// Keychain keys for this device's saved credentials.
+    var credentialKeys: [String] {
+        CredentialStore.keys(endpoint: discovered?.endpointReference, url: url)
+    }
 
     init(id: String, url: URL, name: String, host: String) {
         self.id = id
@@ -39,6 +45,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
     private var busyCount = 0
     private var isScanning = false
     private var lastUsername: String = UserDefaults.standard.string(forKey: "lastUsername") ?? "admin"
+    private var rememberPasswords: Bool = (UserDefaults.standard.object(forKey: "rememberPasswords") as? Bool) ?? true
 
     convenience init(title: String) {
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1180, height: 720),
@@ -48,6 +55,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         window.minSize = NSSize(width: 860, height: 460)
         self.init(window: window)
         buildUI()
+        restoreManualDevices()
         window.center()
         window.setFrameAutosaveName("ONVIFBrowserMainWindow")
     }
@@ -262,20 +270,20 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
             if let existing = self.entries.first(where: { $0.url == url }) {
                 entry = existing
             } else {
-                let host = url.host ?? url.absoluteString
-                entry = DeviceEntry(id: url.absoluteString, url: url, name: host, host: host)
-                entry.status = "Додано вручну"
+                entry = self.makeManualEntry(url)
                 self.entries.append(entry)
                 self.deviceTable.reloadData()
             }
+            ManualDevices.add(url)
             if let row = self.entries.firstIndex(where: { $0 === entry }) {
                 self.deviceTable.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
                 self.deviceTable.scrollRowToVisible(row)
             }
             // Open the next sheet once this one has fully closed.
             DispatchQueue.main.async {
-                self.askCredentials(title: "Вхід: \(entry.name)") { credentials in
-                    self.load(entry, credentials: credentials)
+                self.askCredentials(title: "Вхід: \(entry.name)",
+                                    prefill: CredentialStore.load(keys: entry.credentialKeys)) { credentials, remember in
+                    self.load(entry, credentials: credentials, remember: remember)
                 }
             }
         }
@@ -288,8 +296,9 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
             setStatus("Спочатку оберіть пристрій у списку")
             return
         }
-        askCredentials(title: "Вхід: \(entry.name) (\(entry.host))") { credentials in
-            self.load(entry, credentials: credentials)
+        let saved = entry.credentials ?? CredentialStore.load(keys: entry.credentialKeys)
+        askCredentials(title: "Вхід: \(entry.name) (\(entry.host))", prefill: saved) { credentials, remember in
+            self.load(entry, credentials: credentials, remember: remember)
         }
     }
 
@@ -298,9 +307,47 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
             NSSound.beep()
             return
         }
-        askCredentials(title: "Вхід для всіх пристроїв (\(entries.count))") { credentials in
-            for entry in self.entries { self.load(entry, credentials: credentials) }
+        askCredentials(title: "Вхід для всіх пристроїв (\(entries.count))", prefill: nil) { credentials, remember in
+            for entry in self.entries { self.load(entry, credentials: credentials, remember: remember) }
         }
+    }
+
+    @objc func forgetPassword(_ sender: Any?) {
+        guard let entry = selectedEntry else {
+            NSSound.beep()
+            return
+        }
+        CredentialStore.delete(keys: entry.credentialKeys)
+        setStatus("Пароль для \(entry.host) видалено зі зв'язки ключів")
+    }
+
+    @objc func forgetAllPasswords(_ sender: Any?) {
+        guard let window = window else { return }
+        let alert = NSAlert()
+        alert.messageText = "Видалити всі збережені паролі?"
+        alert.informativeText = "Усі логіни й паролі камер, збережені ONVIF Browser у зв'язці ключів, буде видалено."
+        alert.addButton(withTitle: "Видалити")
+        alert.addButton(withTitle: "Скасувати")
+        alert.beginSheetModal(for: window) { response in
+            guard response == .alertFirstButtonReturn else { return }
+            CredentialStore.deleteAll()
+            self.setStatus("Усі збережені паролі видалено")
+        }
+    }
+
+    @objc func removeDevice(_ sender: Any?) {
+        guard let entry = selectedEntry, let row = entries.firstIndex(where: { $0 === entry }) else {
+            NSSound.beep()
+            return
+        }
+        ManualDevices.remove(entry.url)
+        entries.remove(at: row)
+        deviceTable.reloadData()
+        if !entries.isEmpty {
+            deviceTable.selectRowIndexes(IndexSet(integer: min(row, entries.count - 1)), byExtendingSelection: false)
+        }
+        showSelected()
+        setStatus("\(entry.host) прибрано зі списку")
     }
 
     @objc func copyReport(_ sender: Any?) {
@@ -476,6 +523,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
 
     private func merge(_ found: [DiscoveredDevice]) {
         let selectedID = selectedEntry?.id
+        var newEntries: [DeviceEntry] = []
         for device in found {
             guard let url = device.serviceURL else { continue }
             let id = device.endpointReference.isEmpty ? url.absoluteString : device.endpointReference
@@ -491,6 +539,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
                 entry.model = device.hardware ?? ""
                 entry.status = "Знайдено"
                 entries.append(entry)
+                newEntries.append(entry)
             }
         }
         entries.sort { a, b in
@@ -503,9 +552,34 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
             deviceTable.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
         }
         showSelected()
+        for entry in newEntries { autoLogin(entry) }
     }
 
-    private func askCredentials(title: String, completion: @escaping (Credentials) -> Void) {
+    private func makeManualEntry(_ url: URL) -> DeviceEntry {
+        let host = url.host ?? url.absoluteString
+        let entry = DeviceEntry(id: url.absoluteString, url: url, name: host, host: host)
+        entry.isManual = true
+        entry.status = "Додано вручну"
+        return entry
+    }
+
+    private func restoreManualDevices() {
+        for url in ManualDevices.urls where !entries.contains(where: { $0.url == url }) {
+            entries.append(makeManualEntry(url))
+        }
+        deviceTable.reloadData()
+        for entry in entries { autoLogin(entry) }
+    }
+
+    /// Connects with the password saved in the keychain, if there is one.
+    private func autoLogin(_ entry: DeviceEntry) {
+        guard entry.report == nil, !entry.isLoading,
+              let saved = CredentialStore.load(keys: entry.credentialKeys) else { return }
+        load(entry, credentials: saved, remember: false, fromKeychain: true)
+    }
+
+    private func askCredentials(title: String, prefill: Credentials?,
+                                completion: @escaping (Credentials, Bool) -> Void) {
         guard let window = window else { return }
         let alert = NSAlert()
         alert.messageText = title
@@ -513,30 +587,37 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         alert.addButton(withTitle: "Підключитись")
         alert.addButton(withTitle: "Скасувати")
 
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 58))
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 86))
         let userLabel = NSTextField(labelWithString: "Логін:")
-        userLabel.frame = NSRect(x: 0, y: 34, width: 70, height: 20)
-        let user = NSTextField(frame: NSRect(x: 75, y: 32, width: 245, height: 24))
-        user.stringValue = lastUsername
+        userLabel.frame = NSRect(x: 0, y: 62, width: 70, height: 20)
+        let user = NSTextField(frame: NSRect(x: 75, y: 60, width: 245, height: 24))
+        user.stringValue = prefill?.username ?? lastUsername
         let passLabel = NSTextField(labelWithString: "Пароль:")
-        passLabel.frame = NSRect(x: 0, y: 4, width: 70, height: 20)
-        let pass = NSSecureTextField(frame: NSRect(x: 75, y: 2, width: 245, height: 24))
-        for v in [userLabel, user, passLabel, pass] { container.addSubview(v) }
+        passLabel.frame = NSRect(x: 0, y: 32, width: 70, height: 20)
+        let pass = NSSecureTextField(frame: NSRect(x: 75, y: 30, width: 245, height: 24))
+        pass.stringValue = prefill?.password ?? ""
+        let remember = NSButton(checkboxWithTitle: "Запам'ятати пароль у зв'язці ключів", target: nil, action: nil)
+        remember.frame = NSRect(x: 73, y: 2, width: 247, height: 20)
+        remember.state = rememberPasswords ? .on : .off
+        for v in [userLabel, user, passLabel, pass, remember] { container.addSubview(v) }
         user.nextKeyView = pass
-        pass.nextKeyView = user
+        pass.nextKeyView = remember
+        remember.nextKeyView = user
         alert.accessoryView = container
-        alert.window.initialFirstResponder = lastUsername.isEmpty ? user : pass
+        alert.window.initialFirstResponder = user.stringValue.isEmpty ? user : pass
 
         alert.beginSheetModal(for: window) { response in
             guard response == .alertFirstButtonReturn else { return }
             let username = user.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             self.lastUsername = username
             UserDefaults.standard.set(username, forKey: "lastUsername")
-            completion(Credentials(username: username, password: pass.stringValue))
+            self.rememberPasswords = remember.state == .on
+            UserDefaults.standard.set(self.rememberPasswords, forKey: "rememberPasswords")
+            completion(Credentials(username: username, password: pass.stringValue), self.rememberPasswords)
         }
     }
 
-    private func load(_ entry: DeviceEntry, credentials: Credentials) {
+    private func load(_ entry: DeviceEntry, credentials: Credentials, remember: Bool, fromKeychain: Bool = false) {
         guard !entry.isLoading else { return }
         entry.credentials = credentials.isEmpty ? nil : credentials
         entry.isLoading = true
@@ -544,17 +625,24 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         entry.statusIsError = false
         refresh(entry)
         setBusy(1)
-        setStatus("Підключення до \(entry.host)…")
+        setStatus(fromKeychain ? "Підключення до \(entry.host) зі збереженим паролем…" : "Підключення до \(entry.host)…")
 
         Task {
             let report = await DeviceReporter.build(url: entry.url, credentials: entry.credentials)
             entry.isLoading = false
             entry.report = report
             if report.authFailed {
-                entry.status = "Невірний логін"
+                entry.status = fromKeychain ? "Збережений пароль не підходить" : "Невірний логін"
                 entry.statusIsError = true
             } else if let s = report.summary {
                 entry.status = "OK"
+                if remember, !credentials.isEmpty {
+                    // Saved only after a successful login, so a mistyped password is never stored.
+                    CredentialStore.save(credentials, keys: entry.credentialKeys)
+                } else if !remember, !fromKeychain {
+                    // The user unticked "remember": drop a password saved earlier.
+                    CredentialStore.delete(keys: entry.credentialKeys)
+                }
                 entry.model = [s.manufacturer, s.model].filter { !$0.isEmpty }.joined(separator: " ")
                 if entry.discovered?.name == nil {
                     entry.name = entry.model.isEmpty ? entry.host : entry.model
